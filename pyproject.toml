@@ -1,0 +1,25 @@
+[tool.poetry]
+name = "sail-data-upload"
+version = "0.1.0"
+description = "service to encrypt and package datasets securely in a TEE"
+authors = ["Prawal Gangwar <prawal@secureailabs.com>"]
+readme = "README.md"
+packages = [{include = "sail_data_upload"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fastapi = "^0.95.0"
+uvicorn = {extras = ["standard"], version = "^0.21.1"}
+fastapi-responses = {git = "https://github.com/secureailabs/fastapi-responses"}
+azure-mgmt-storage = "^21.0.0"
+azure-storage-file-share = "^12.11.1"
+pycryptodome = "^3.17"
+
+
+[tool.poetry.group.dev.dependencies]
+flake8 = "4.0.1"
+black = "^23.3.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
