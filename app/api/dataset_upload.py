@@ -21,10 +21,25 @@ from zipfile import ZipFile
 
 from azure.storage.fileshare import ShareFileClient
 from Crypto.Cipher import AES
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordBearer
-from sail_client import AuthenticatedClient, SyncAuthenticatedOperations
-from sail_client.models import DatasetVersionState, UpdateDatasetVersionIn
+from sail_client import AuthenticatedClient
+from sail_client.api.default import (
+    get_all_data_federations,
+    get_dataset,
+    get_dataset_key,
+    get_dataset_version,
+    get_dataset_version_connection_string,
+    update_dataset_version,
+)
+from sail_client.models import (
+    DatasetEncryptionKeyOut,
+    DatasetVersionState,
+    GetDatasetVersionConnectionStringOut,
+    GetDatasetVersionOut,
+    GetMultipleDataFederationOut,
+    UpdateDatasetVersionIn,
+)
 
 from app.models.common import PyObjectId
 
@@ -68,6 +83,150 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return token
 
 
+def get_secret(secret_name: str) -> str:
+    """Get the secret value from the environment variable"""
+    return os.environ[secret_name]
+
+
+def encrypt_and_upload(
+    current_user_token: str,
+    dataset_version_id: PyObjectId,
+    dataset_files: List[UploadFile],
+):
+    api_client = AuthenticatedClient(
+        base_url=get_secret("SAIL_API_SERVICE_URL"),
+        timeout=60,
+        raise_on_unexpected_status=True,
+        verify_ssl=False,
+        token=current_user_token,
+        follow_redirects=False,
+    )
+
+    # Create a working directory for this request
+    random_id = base64.b64encode(os.urandom(12)).decode("utf-8")
+    working_dir = os.path.join(os.getcwd(), f"./tmp/{str(dataset_version_id)}-{random_id}")
+
+    try:
+        os.makedirs(working_dir, exist_ok=True)
+
+        # Copy the files to the working directory
+        local_files = []
+        for dataset_file in dataset_files:
+            shutil.copyfileobj(dataset_file.file, open(f"{working_dir}/{dataset_file.filename}", "wb"))
+            local_files.append(f"{working_dir}/{dataset_file.filename}")
+
+        # Get the dataset version
+        dataset_version = get_dataset_version.sync(client=api_client, dataset_version_id=str(dataset_version_id))
+        assert type(dataset_version) == GetDatasetVersionOut
+
+        # Upload only if the dataset version is in the NOT_UPLOAD state
+        if dataset_version.state != DatasetVersionState.NOT_UPLOADED:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="Dataset version is not in NOT_UPLOAD state."
+            )
+
+        # Mark the dataset version as encrypting
+        update_dataset_version.sync(
+            client=api_client,
+            dataset_version_id=str(dataset_version_id),
+            json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ENCRYPTING),
+        )
+
+        # GetConnectionStringForDatasetVersion
+        connection_string_req = get_dataset_version_connection_string.sync(
+            client=api_client, dataset_version_id=str(dataset_version_id)
+        )
+        assert type(connection_string_req) == GetDatasetVersionConnectionStringOut
+        connection_string = connection_string_req.connection_string
+
+        # Get the dataset for the dataset version
+        dataset_id = dataset_version.dataset_id
+        dataset = get_dataset.sync(client=api_client, dataset_id=dataset_id)
+        assert type(dataset) == GetDatasetVersionOut
+
+        # Get the data federation
+        data_federation_list = get_all_data_federations.sync(client=api_client)
+        assert type(data_federation_list) == GetMultipleDataFederationOut
+        if not data_federation_list.data_federations:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="No data federation found for the dataset."
+            )
+        data_federation = data_federation_list.data_federations[0]  # type: ignore
+
+        # GetEncryptionKeyForDataset
+        encryption_key_response = get_dataset_key.sync(
+            client=api_client, data_federation_id=str(data_federation.id), dataset_id=dataset_id
+        )
+        assert type(encryption_key_response) == DatasetEncryptionKeyOut
+        encryption_key = encryption_key_response.dataset_key
+
+        # Create a dataset header
+        dataset_header = {}
+        dataset_header["dataset_id"] = dataset_id
+        dataset_header["dataset_name"] = dataset.name
+        dataset_header["data_federation_id"] = data_federation.id
+        dataset_header["data_federation_name"] = data_federation.name
+        dataset_header["dataset_packaging_format"] = "csvv1"
+
+        # Create a zip package with the data files
+        data_content_zip_file = f"{working_dir}/data_content.zip"
+        create_zip_from_files(data_content_zip_file, local_files)
+
+        # Encrypt the data content zip file
+        nonce = os.urandom(12)
+        key = base64.b64decode(encryption_key)
+        tag = encrypt_file_in_place(data_content_zip_file, key, nonce)
+
+        # Create a file with name dataset_header.json
+        dataset_header_file = f"{working_dir}/dataset_header.json"
+        dataset_header["aes_tag"] = base64.b64encode(tag).decode("utf-8")
+        dataset_header["aes_nonce"] = base64.b64encode(nonce).decode("utf-8")
+        with open(dataset_header_file, "w") as f:
+            f.write(json.dumps(dataset_header))
+
+        # Get data model
+        data_model = data_federation.data_model
+
+        # Create a data_model zip file
+        data_model_file = f"{working_dir}/data_model.json"
+        data_model_zip_file = f"{working_dir}/data_model.zip"
+        with open(data_model_file, "w") as f:
+            f.write(str(data_model))
+        create_zip_from_files(data_model_zip_file, [f"{working_dir}/data_model.json"])
+
+        # Create a zip file with the dataset header, data model and data content
+        big_zip_files = [dataset_header_file, data_model_zip_file, data_content_zip_file]
+        dataset_file = f"{working_dir}/dataset_{dataset_version_id}.zip"
+        create_zip_from_files(dataset_file, big_zip_files)
+
+        # Upload the zip file to the Azure File Share
+        with open(dataset_file, "rb") as f:
+            # Upload the files created tar file to Azure file share using the sas token
+            file_client = ShareFileClient.from_file_url(file_url=connection_string)
+            file_client.create_file(size=f.tell())
+            file_client.upload_file(f)
+
+        # Mark the dataset version as ready
+        update_dataset_version.sync(
+            client=api_client,
+            dataset_version_id=str(dataset_version_id),
+            json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ACTIVE),
+        )
+
+        # Delete the working directory
+        shutil.rmtree(working_dir)
+    except Exception as e:
+        # Mark the dataset version as failed
+        update_dataset_version.sync(
+            client=api_client,
+            dataset_version_id=str(dataset_version_id),
+            json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ERROR),
+        )
+        # Delete the working directory
+        shutil.rmtree(working_dir)
+        raise e
+
+
 @router.post(
     path="/upload-dataset",
     description="Upload new data to File Share",
@@ -77,106 +236,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     operation_id="upload_dataset",
 )
 async def upload_dataset(
+    background_tasks: BackgroundTasks,
     dataset_files: List[UploadFile] = File(description="application/json"),
     dataset_version_id: PyObjectId = Query(description="Dataset Version Id"),
     current_user_token=Depends(get_current_user),
 ):
-    client = AuthenticatedClient(
-        base_url="https://172.20.100.6:8000",
-        timeout=60,
-        raise_on_unexpected_status=True,
-        verify_ssl=False,
-        token=current_user_token,
-    )
-    api_client = SyncAuthenticatedOperations(client)
-
-    # Create a working directory for this request
-    random_id = base64.b64encode(os.urandom(12)).decode("utf-8")
-    working_dir = os.path.join(os.getcwd(), f"./tmp/{dataset_version_id}-{random_id}")
-    os.makedirs(working_dir, exist_ok=True)
-
-    # Copy the files to the working directory
-    local_files = []
-    for dataset_file in dataset_files:
-        shutil.copyfileobj(dataset_file.file, open(f"{working_dir}/{dataset_file.filename}", "wb"))
-        local_files.append(f"{working_dir}/{dataset_file.filename}")
-
-    # Get the dataset version
-    dataset_version = api_client.get_dataset_version(str(dataset_version_id))
-
-    # Upload only if the dataset version is in the NOT_UPLOAD state
-    if dataset_version.state != DatasetVersionState.NOT_UPLOADED:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Dataset version is not in NOT_UPLOAD state.")
-
-    # Mark the dataset version as encrypting
-    # await update_dataset_version(dataset_version_id, UpdateDatasetVersion_In(state=DatasetVersionState.ENCRYPTING), current_user)
-
-    # GetConnectionStringForDatasetVersion
-    connection_string = api_client.get_dataset_version_connection_string(str(dataset_version_id)).connection_string
-
-    # Get the dataset for the dataset version
-    dataset_id = dataset_version.dataset_id
-    dataset = api_client.get_dataset(dataset_id)
-
-    # Get the data federation
-    data_federation_list = api_client.get_all_data_federations()
-    if not data_federation_list.data_federations:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No data federation found for the dataset.")
-    data_federation = data_federation_list.data_federations[0]  # type: ignore
-
-    # GetEncryptionKeyForDataset
-    encryption_key = api_client.get_dataset_key(str(data_federation.id), dataset_id=dataset_id).dataset_key
-
-    # Create a dataset header
-    dataset_header = {}
-    dataset_header["dataset_id"] = dataset_id
-    dataset_header["dataset_name"] = dataset.name
-    dataset_header["data_federation_id"] = data_federation.id
-    dataset_header["data_federation_name"] = data_federation.name
-    dataset_header["dataset_packaging_format"] = "csvv1"
-
-    # Create a zip package with the data files
-    data_content_zip_file = f"{working_dir}/data_content.zip"
-    create_zip_from_files(data_content_zip_file, local_files)
-
-    # Encrypt the data content zip file
-    nonce = os.urandom(12)
-    key = base64.b64decode(encryption_key)
-    tag = encrypt_file_in_place(data_content_zip_file, key, nonce)
-
-    # Create a file with name dataset_header.json
-    dataset_header_file = f"{working_dir}/dataset_header.json"
-    dataset_header["aes_tag"] = base64.b64encode(tag).decode("utf-8")
-    dataset_header["aes_nonce"] = base64.b64encode(nonce).decode("utf-8")
-    with open(dataset_header_file, "w") as f:
-        f.write(json.dumps(dataset_header))
-
-    # Get data model
-    data_model = data_federation.data_model
-
-    # Create a data_model zip file
-    data_model_file = f"{working_dir}/data_model.json"
-    data_model_zip_file = f"{working_dir}/data_model.zip"
-    with open(data_model_file, "w") as f:
-        f.write(str(data_model))
-    create_zip_from_files(data_model_zip_file, [f"{working_dir}/data_model.json"])
-
-    # Create a zip file with the dataset header, data model and data content
-    big_zip_files = [dataset_header_file, data_model_zip_file, data_content_zip_file]
-    dataset_file = f"{working_dir}/dataset_{dataset_version_id}.zip"
-    create_zip_from_files(dataset_file, big_zip_files)
-
-    # Upload the zip file to the Azure File Share
-    with open(dataset_file, "rb") as f:
-        # Upload the files created tar file to Azure file share using the sas token
-        file_client = ShareFileClient.from_file_url(file_url=connection_string)
-        file_client.create_file(size=f.tell())
-        file_client.upload_file(f)
-
-    # Mark the dataset version as ready
-    api_client.update_dataset_version(str(dataset_version_id), UpdateDatasetVersionIn(state=DatasetVersionState.ACTIVE))
-
-    # Delete the working directory
-    shutil.rmtree(working_dir)
-
-    return Response(status_code=200)
+    background_tasks.add_task(encrypt_and_upload, current_user_token, dataset_version_id, dataset_files)
+    return Response(status_code=status.HTTP_202_ACCEPTED)

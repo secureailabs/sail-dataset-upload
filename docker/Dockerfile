@@ -20,13 +20,16 @@ RUN apt-get update && \
   python3-pip \
   jq
 
-COPY docker/requirements.txt /requirements.txt
+COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY docker/nginx.conf /etc/nginx/nginx.conf
 
 COPY docker/Entrypoint.sh /Entrypoint.sh
 RUN chmod +x /Entrypoint.sh
+
+COPY sail_client-0.1.0-py3-none-any.whl /sail_client-0.1.0-py3-none-any.whl
+RUN pip install --no-cache-dir /sail_client-0.1.0-py3-none-any.whl
 
 COPY app /app
 

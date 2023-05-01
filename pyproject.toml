@@ -10,10 +10,11 @@ packages = [{include = "sail_data_upload"}]
 python = "^3.8"
 fastapi = "^0.95.0"
 uvicorn = {extras = ["standard"], version = "^0.21.1"}
-fastapi-responses = {git = "https://github.com/secureailabs/fastapi-responses"}
 azure-mgmt-storage = "^21.0.0"
 azure-storage-file-share = "^12.11.1"
 pycryptodome = "^3.17"
+sail-client = {path = "sail_client-0.1.0-py3-none-any.whl"}
+python-multipart = "^0.0.6"
 
 
 [tool.poetry.group.dev.dependencies]
