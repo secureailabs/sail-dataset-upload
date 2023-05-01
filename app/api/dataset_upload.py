@@ -21,11 +21,14 @@ from zipfile import ZipFile
 
 from azure.storage.fileshare import ShareFileClient
 from Crypto.Cipher import AES
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordBearer
 from sail_client import AuthenticatedClient
 from sail_client.api.default import (
     get_all_data_federations,
+    get_data_model_dataframe_info,
+    get_data_model_info,
+    get_data_model_series_info,
     get_dataset,
     get_dataset_key,
     get_dataset_version,
@@ -35,6 +38,10 @@ from sail_client.api.default import (
 from sail_client.models import (
     DatasetEncryptionKeyOut,
     DatasetVersionState,
+    GetDataModelDataframeOut,
+    GetDataModelOut,
+    GetDataModelSeriesOut,
+    GetDatasetOut,
     GetDatasetVersionConnectionStringOut,
     GetDatasetVersionOut,
     GetMultipleDataFederationOut,
@@ -42,6 +49,7 @@ from sail_client.models import (
 )
 
 from app.models.common import PyObjectId
+from app.models.data_model import DataFrameDataModel, DataModel, SeriesDataModel
 
 router = APIRouter()
 
@@ -121,9 +129,7 @@ def encrypt_and_upload(
 
         # Upload only if the dataset version is in the NOT_UPLOAD state
         if dataset_version.state != DatasetVersionState.NOT_UPLOADED:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="Dataset version is not in NOT_UPLOAD state."
-            )
+            raise Exception("Dataset version is not in NOT_UPLOAD state.")
 
         # Mark the dataset version as encrypting
         update_dataset_version.sync(
@@ -142,15 +148,13 @@ def encrypt_and_upload(
         # Get the dataset for the dataset version
         dataset_id = dataset_version.dataset_id
         dataset = get_dataset.sync(client=api_client, dataset_id=dataset_id)
-        assert type(dataset) == GetDatasetVersionOut
+        assert type(dataset) == GetDatasetOut
 
         # Get the data federation
         data_federation_list = get_all_data_federations.sync(client=api_client)
         assert type(data_federation_list) == GetMultipleDataFederationOut
         if not data_federation_list.data_federations:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="No data federation found for the dataset."
-            )
+            raise Exception("No data federation found for the dataset.")
         data_federation = data_federation_list.data_federations[0]  # type: ignore
 
         # GetEncryptionKeyForDataset
@@ -184,14 +188,83 @@ def encrypt_and_upload(
         with open(dataset_header_file, "w") as f:
             f.write(json.dumps(dataset_header))
 
-        # Get data model
-        data_model = data_federation.data_model
+        # TODO: Get data model
+        data_model_id = data_federation.data_model_id
+        if type(data_model_id) != str:
+            raise Exception("No data model found for the data federation.")
+
+        data_model = get_data_model_info.sync(client=api_client, data_model_id=data_model_id)
+        if type(data_model) != GetDataModelOut:
+            raise Exception("Error parsing data model.")
+
+        data_model_full = DataModel(
+            type=data_model.name, tabular_dataset_data_model_id=data_model.id, list_data_frame_data_model=[]
+        )
+        for dataframe_id in data_model.data_model_dataframes:
+            # Get the data model dataframe
+            data_model_dataframe = get_data_model_dataframe_info.sync(
+                client=api_client, data_model_dataframe_id=dataframe_id
+            )
+            if type(data_model_dataframe) != GetDataModelDataframeOut:
+                raise Exception("Error parsing data model dataframe.")
+
+            # Get the data model dataframe series
+            data_model_dataframe_series = get_data_model_dataframe_info.sync(
+                client=api_client, data_model_dataframe_id=dataframe_id
+            )
+            if type(data_model_dataframe_series) != GetDataModelDataframeOut:
+                raise Exception("Error parsing data model dataframe.")
+
+            # Create a dataframe
+            dataframe = DataFrameDataModel(
+                type=data_model_dataframe.name,
+                data_frame_name=data_model_dataframe.name,
+                data_frame_data_model_id=data_model_dataframe.id,
+                list_series_data_model=[],
+            )
+
+            # Fetch all the series
+            for series_id in data_model_dataframe.data_model_series:
+                # Get the data model series
+                data_model_series = get_data_model_series_info.sync(client=api_client, data_model_series_id=series_id)
+                if type(data_model_series) != GetDataModelSeriesOut:
+                    raise Exception("Error parsing data model series.")
+
+                # Create a series
+                series = SeriesDataModel(
+                    type=data_model_series.series_schema.type,
+                    series_name=data_model_series.name,
+                    series_data_model_id=data_model_series.id,
+                    list_value=data_model_series.series_schema.list_value
+                    if type(data_model_series.series_schema.list_value) == List
+                    else [],
+                    unit=data_model_series.series_schema.unit
+                    if type(data_model_series.series_schema.unit) == str
+                    else None,
+                    min=data_model_series.series_schema.min_
+                    if type(data_model_series.series_schema.min_) == float
+                    else None,
+                    max=data_model_series.series_schema.max_
+                    if type(data_model_series.series_schema.max_) == float
+                    else None,
+                    resolution=data_model_series.series_schema.resolution
+                    if type(data_model_series.series_schema.resolution) == float
+                    else None,
+                )
+
+                # Add the series to the dataframe
+                dataframe.list_series_data_model.append(series)
+
+            # Add the dataframe to the data model
+            data_model_full.list_data_frame_data_model.append(dataframe)
+
+        data_model_txt = data_model_full.json(exclude_unset=True)
 
         # Create a data_model zip file
         data_model_file = f"{working_dir}/data_model.json"
         data_model_zip_file = f"{working_dir}/data_model.zip"
         with open(data_model_file, "w") as f:
-            f.write(str(data_model))
+            f.write(data_model_txt)
         create_zip_from_files(data_model_zip_file, [f"{working_dir}/data_model.json"])
 
         # Create a zip file with the dataset header, data model and data content

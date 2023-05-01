@@ -8,6 +8,8 @@
             "module": "uvicorn",
             "args": [
                 "app.main:server",
+                "--port",
+                "9000",
                 "--reload"
             ],
             "jinja": true,
