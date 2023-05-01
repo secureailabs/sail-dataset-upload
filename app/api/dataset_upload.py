@@ -21,7 +21,7 @@ from zipfile import ZipFile
 
 from azure.storage.fileshare import ShareFileClient
 from Crypto.Cipher import AES
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Query, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.security import OAuth2PasswordBearer
 from sail_client import AuthenticatedClient
 from sail_client.api.default import (
@@ -97,22 +97,13 @@ def get_secret(secret_name: str) -> str:
 
 
 def encrypt_and_upload(
-    current_user_token: str,
-    dataset_version_id: PyObjectId,
+    api_client: AuthenticatedClient,
+    dataset_version: GetDatasetVersionOut,
     dataset_files: List[UploadFile],
 ):
-    api_client = AuthenticatedClient(
-        base_url=get_secret("SAIL_API_SERVICE_URL"),
-        timeout=60,
-        raise_on_unexpected_status=True,
-        verify_ssl=False,
-        token=current_user_token,
-        follow_redirects=False,
-    )
-
     # Create a working directory for this request
     random_id = base64.b64encode(os.urandom(12)).decode("utf-8")
-    working_dir = os.path.join(os.getcwd(), f"./tmp/{str(dataset_version_id)}-{random_id}")
+    working_dir = os.path.join(os.getcwd(), f"./tmp/{dataset_version.id}-{random_id}")
 
     try:
         os.makedirs(working_dir, exist_ok=True)
@@ -123,24 +114,16 @@ def encrypt_and_upload(
             shutil.copyfileobj(dataset_file.file, open(f"{working_dir}/{dataset_file.filename}", "wb"))
             local_files.append(f"{working_dir}/{dataset_file.filename}")
 
-        # Get the dataset version
-        dataset_version = get_dataset_version.sync(client=api_client, dataset_version_id=str(dataset_version_id))
-        assert type(dataset_version) == GetDatasetVersionOut
-
-        # Upload only if the dataset version is in the NOT_UPLOAD state
-        if dataset_version.state != DatasetVersionState.NOT_UPLOADED:
-            raise Exception("Dataset version is not in NOT_UPLOAD state.")
-
         # Mark the dataset version as encrypting
         update_dataset_version.sync(
             client=api_client,
-            dataset_version_id=str(dataset_version_id),
+            dataset_version_id=dataset_version.id,
             json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ENCRYPTING),
         )
 
         # GetConnectionStringForDatasetVersion
         connection_string_req = get_dataset_version_connection_string.sync(
-            client=api_client, dataset_version_id=str(dataset_version_id)
+            client=api_client, dataset_version_id=dataset_version.id
         )
         assert type(connection_string_req) == GetDatasetVersionConnectionStringOut
         connection_string = connection_string_req.connection_string
@@ -269,7 +252,7 @@ def encrypt_and_upload(
 
         # Create a zip file with the dataset header, data model and data content
         big_zip_files = [dataset_header_file, data_model_zip_file, data_content_zip_file]
-        dataset_file = f"{working_dir}/dataset_{dataset_version_id}.zip"
+        dataset_file = f"{working_dir}/dataset_{dataset_version.id}.zip"
         create_zip_from_files(dataset_file, big_zip_files)
 
         # Upload the zip file to the Azure File Share
@@ -282,7 +265,7 @@ def encrypt_and_upload(
         # Mark the dataset version as ready
         update_dataset_version.sync(
             client=api_client,
-            dataset_version_id=str(dataset_version_id),
+            dataset_version_id=dataset_version.id,
             json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ACTIVE),
         )
 
@@ -292,7 +275,7 @@ def encrypt_and_upload(
         # Mark the dataset version as failed
         update_dataset_version.sync(
             client=api_client,
-            dataset_version_id=str(dataset_version_id),
+            dataset_version_id=dataset_version.id,
             json_body=UpdateDatasetVersionIn(state=DatasetVersionState.ERROR),
         )
         # Delete the working directory
@@ -314,5 +297,23 @@ async def upload_dataset(
     dataset_version_id: PyObjectId = Query(description="Dataset Version Id"),
     current_user_token=Depends(get_current_user),
 ):
-    background_tasks.add_task(encrypt_and_upload, current_user_token, dataset_version_id, dataset_files)
+    api_client = AuthenticatedClient(
+        base_url=get_secret("SAIL_API_SERVICE_URL"),
+        timeout=60,
+        raise_on_unexpected_status=True,
+        verify_ssl=False,
+        token=current_user_token,
+        follow_redirects=False,
+    )
+
+    # Get the dataset version
+    dataset_version = get_dataset_version.sync(client=api_client, dataset_version_id=str(dataset_version_id))
+    if type(dataset_version) != GetDatasetVersionOut:
+        raise HTTPException(status_code=500, detail="Error parsing dataset version.")
+
+    # Upload only if the dataset version is in the NOT_UPLOAD state
+    if dataset_version.state != DatasetVersionState.NOT_UPLOADED:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Dataset version is not in NOT_UPLOAD state.")
+
+    background_tasks.add_task(encrypt_and_upload, api_client, dataset_version, dataset_files)
     return Response(status_code=status.HTTP_202_ACCEPTED)
