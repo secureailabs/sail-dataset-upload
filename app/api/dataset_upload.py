@@ -54,13 +54,14 @@ from app.models.data_model import DataFrameDataModel, DataModel, SeriesDataModel
 router = APIRouter()
 
 
-def create_zip_from_files(zip_file, files):
+def create_zip_from_files(zip_file: str, files: List[str]):
     with ZipFile(zip_file, "w") as zipObj:
         for file in files:
-            zipObj.write(file)
+            # Add file to zip with only the filename
+            zipObj.write(file, os.path.basename(file))
 
 
-def encrypt_file_in_place(file, key, nonce):
+def encrypt_file_in_place(file: str, key, nonce):
     # Check the size of the key and nonce
     if len(key) != 32:
         raise Exception("The key must be 256 bits")
@@ -109,7 +110,7 @@ def encrypt_and_upload(
         os.makedirs(working_dir, exist_ok=True)
 
         # Copy the files to the working directory
-        local_files = []
+        local_files: List[str] = []
         for dataset_file in dataset_files:
             shutil.copyfileobj(dataset_file.file, open(f"{working_dir}/{dataset_file.filename}", "wb"))
             local_files.append(f"{working_dir}/{dataset_file.filename}")
