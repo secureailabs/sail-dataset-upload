@@ -26,6 +26,8 @@ from fastapi.security import OAuth2PasswordBearer
 from sail_client import AuthenticatedClient
 from sail_client.api.default import (
     get_all_data_federations,
+    get_all_data_model_dataframe_info,
+    get_all_data_model_series_info,
     get_data_model_dataframe_info,
     get_data_model_info,
     get_data_model_series_info,
@@ -45,6 +47,8 @@ from sail_client.models import (
     GetDatasetVersionConnectionStringOut,
     GetDatasetVersionOut,
     GetMultipleDataFederationOut,
+    GetMultipleDataModelDataframeOut,
+    GetMultipleDataModelSeriesOut,
     UpdateDatasetVersionIn,
 )
 
@@ -184,36 +188,30 @@ def encrypt_and_upload(
         data_model_full = DataModel(
             type=data_model.name, tabular_dataset_data_model_id=data_model.id, list_data_frame_data_model=[]
         )
-        for dataframe_id in data_model.data_model_dataframes:
-            # Get the data model dataframe
-            data_model_dataframe = get_data_model_dataframe_info.sync(
-                client=api_client, data_model_dataframe_id=dataframe_id
-            )
-            if type(data_model_dataframe) != GetDataModelDataframeOut:
-                raise Exception("Error parsing data model dataframe.")
 
-            # Get the data model dataframe series
-            data_model_dataframe_series = get_data_model_dataframe_info.sync(
-                client=api_client, data_model_dataframe_id=dataframe_id
-            )
-            if type(data_model_dataframe_series) != GetDataModelDataframeOut:
-                raise Exception("Error parsing data model dataframe.")
+        # Get all the data model dataframes
+        dataframes_list = get_all_data_model_dataframe_info.sync(client=api_client, data_model_id=data_model_id)
+        if type(dataframes_list) != GetMultipleDataModelDataframeOut:
+            raise Exception("Error parsing data model dataframes.")
 
+        for dataframe_data_model in dataframes_list.data_model_dataframes:
             # Create a dataframe
             dataframe = DataFrameDataModel(
-                type=data_model_dataframe.name,
-                data_frame_name=data_model_dataframe.name,
-                data_frame_data_model_id=data_model_dataframe.id,
+                type=dataframe_data_model.name,
+                data_frame_name=dataframe_data_model.name,
+                data_frame_data_model_id=dataframe_data_model.id,
                 list_series_data_model=[],
             )
 
-            # Fetch all the series
-            for series_id in data_model_dataframe.data_model_series:
-                # Get the data model series
-                data_model_series = get_data_model_series_info.sync(client=api_client, data_model_series_id=series_id)
-                if type(data_model_series) != GetDataModelSeriesOut:
-                    raise Exception("Error parsing data model series.")
+            # Get all the data model series
+            series_list = get_all_data_model_series_info.sync(
+                client=api_client, data_model_dataframe_id=dataframe_data_model.id
+            )
+            if type(series_list) != GetMultipleDataModelSeriesOut:
+                raise Exception("Error parsing data model series.")
 
+            # Fetch all the series
+            for data_model_series in series_list.data_model_series:
                 # Create a series
                 series = SeriesDataModel(
                     type=data_model_series.series_schema.type,
