@@ -26,11 +26,8 @@ from fastapi.security import OAuth2PasswordBearer
 from sail_client import AuthenticatedClient
 from sail_client.api.default import (
     get_all_data_federations,
-    get_all_data_model_dataframe_info,
-    get_all_data_model_series_info,
-    get_data_model_dataframe_info,
     get_data_model_info,
-    get_data_model_series_info,
+    get_data_model_version,
     get_dataset,
     get_dataset_key,
     get_dataset_version,
@@ -40,20 +37,17 @@ from sail_client.api.default import (
 from sail_client.models import (
     DatasetEncryptionKeyOut,
     DatasetVersionState,
-    GetDataModelDataframeOut,
     GetDataModelOut,
-    GetDataModelSeriesOut,
+    GetDataModelVersionOut,
     GetDatasetOut,
     GetDatasetVersionConnectionStringOut,
     GetDatasetVersionOut,
     GetMultipleDataFederationOut,
-    GetMultipleDataModelDataframeOut,
-    GetMultipleDataModelSeriesOut,
     UpdateDatasetVersionIn,
 )
+from sail_client.types import UNSET, Unset
 
 from app.models.common import PyObjectId
-from app.models.data_model import DataFrameDataModel, DataModel, SeriesDataModel
 
 router = APIRouter()
 
@@ -185,62 +179,17 @@ def encrypt_and_upload(
         if type(data_model) != GetDataModelOut:
             raise Exception("Error parsing data model.")
 
-        data_model_full = DataModel(
-            type=data_model.name, tabular_dataset_data_model_id=data_model.id, list_data_frame_data_model=[]
+        # Fetch the current version of the data model
+        if type(data_model.current_version_id) is not str:
+            raise Exception("No current version found for the data model.")
+
+        data_model_full = get_data_model_version.sync(
+            client=api_client, data_model_version_id=data_model.current_version_id
         )
+        if type(data_model_full) != GetDataModelVersionOut:
+            raise Exception("Error parsing data model version.")
 
-        # Get all the data model dataframes
-        dataframes_list = get_all_data_model_dataframe_info.sync(client=api_client, data_model_id=data_model_id)
-        if type(dataframes_list) != GetMultipleDataModelDataframeOut:
-            raise Exception("Error parsing data model dataframes.")
-
-        for dataframe_data_model in dataframes_list.data_model_dataframes:
-            # Create a dataframe
-            dataframe = DataFrameDataModel(
-                type=dataframe_data_model.name,
-                data_frame_name=dataframe_data_model.name,
-                data_frame_data_model_id=dataframe_data_model.id,
-                list_series_data_model=[],
-            )
-
-            # Get all the data model series
-            series_list = get_all_data_model_series_info.sync(
-                client=api_client, data_model_dataframe_id=dataframe_data_model.id
-            )
-            if type(series_list) != GetMultipleDataModelSeriesOut:
-                raise Exception("Error parsing data model series.")
-
-            # Fetch all the series
-            for data_model_series in series_list.data_model_series:
-                # Create a series
-                series = SeriesDataModel(
-                    type=data_model_series.series_schema.type,
-                    series_name=data_model_series.name,
-                    series_data_model_id=data_model_series.id,
-                    list_value=data_model_series.series_schema.list_value
-                    if type(data_model_series.series_schema.list_value) == List
-                    else [],
-                    unit=data_model_series.series_schema.unit
-                    if type(data_model_series.series_schema.unit) == str
-                    else None,
-                    min=data_model_series.series_schema.min_
-                    if type(data_model_series.series_schema.min_) == float
-                    else None,
-                    max=data_model_series.series_schema.max_
-                    if type(data_model_series.series_schema.max_) == float
-                    else None,
-                    resolution=data_model_series.series_schema.resolution
-                    if type(data_model_series.series_schema.resolution) == float
-                    else None,
-                )
-
-                # Add the series to the dataframe
-                dataframe.list_series_data_model.append(series)
-
-            # Add the dataframe to the data model
-            data_model_full.list_data_frame_data_model.append(dataframe)
-
-        data_model_txt = data_model_full.json(exclude_unset=True)
+        data_model_txt = json.dumps(data_model_full.to_dict())
 
         # Create a data_model zip file
         data_model_file = f"{working_dir}/data_model.json"
@@ -300,7 +249,7 @@ async def upload_dataset(
         base_url=get_secret("SAIL_API_SERVICE_URL"),
         timeout=60,
         raise_on_unexpected_status=True,
-        verify_ssl=False,
+        verify_ssl=True,
         token=current_user_token,
         follow_redirects=False,
     )
